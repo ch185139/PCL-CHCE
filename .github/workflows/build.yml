@@ -1,0 +1,91 @@
+name: Build PCL CHCE
+
+# 只手动触发：避免「先建 workflow、后传源码 zip」时第一次自动运行扑空
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build single-file exe
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # 兼容两种上传方式：
+      #  A) 网页只上传了 PCL-CHCE-source.zip  -> 在 runner 上解压
+      #  B) git push 了完整源码              -> 直接用 checkout 出来的目录
+      - name: Locate source
+        shell: pwsh
+        run: |
+          $zip = "PCL-CHCE-source.zip"
+          if (Test-Path $zip) {
+            Write-Output "Found $zip, extracting..."
+            Expand-Archive -Path $zip -DestinationPath src -Force
+            $root = "src\PCL-CHCE"
+          } else {
+            Write-Output "No zip found, using checked-out source tree."
+            $root = "."
+          }
+          $sln = Join-Path $root "Plain Craft Launcher 2.sln"
+          if (-not (Test-Path $sln)) { throw "Solution not found at: $sln" }
+          Add-Content -Path $env:GITHUB_ENV -Value "SOURCE_ROOT=$root" -Encoding utf8
+          Write-Output "SOURCE_ROOT = $root"
+
+      - name: Show toolchain version
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          & $vswhere -latest -property installationVersion
+          # LangVersion 13.0 需要 VS 17.8+，这里应输出 17.x
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: |
+          $sln = Join-Path $env:SOURCE_ROOT "Plain Craft Launcher 2.sln"
+          msbuild $sln /t:Restore /p:Configuration=Release /p:Platform="Any CPU" /v:minimal /nologo
+          if ($LASTEXITCODE -ne 0) { throw "Restore failed" }
+
+      - name: Clean
+        shell: pwsh
+        run: |
+          # 所有配置共用同一个 bin\，必须先清，否则会混进旧 dll
+          $sln = Join-Path $env:SOURCE_ROOT "Plain Craft Launcher 2.sln"
+          msbuild $sln /t:Clean /p:Configuration=Release /p:Platform="Any CPU" /v:minimal /nologo
+
+      - name: Build Release (whole solution)
+        shell: pwsh
+        run: |
+          # 必须整解决方案生成：主项目 Resources.resx 嵌入了 ..\PCLCS\bin\*.dll
+          # Release 是硬性要求：McLaunchPrecheck 的正版购买与赞助劝导仅在
+          # BuildType = Release 时执行
+          $sln = Join-Path $env:SOURCE_ROOT "Plain Craft Launcher 2.sln"
+          msbuild $sln /p:Configuration=Release /p:Platform="Any CPU" /m /v:minimal /nologo
+          if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+
+      - name: Verify and stage exe
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:SOURCE_ROOT "Plain Craft Launcher 2\bin\Plain Craft Launcher 2.exe"
+          if (-not (Test-Path $src)) { throw "Build output not found: $src" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item $src "dist\PCL CHCE.exe" -Force
+          $f = Get-Item "dist\PCL CHCE.exe"
+          Write-Output "exe size = $($f.Length) bytes"
+          Get-FileHash $f.FullName -Algorithm SHA256 | Format-List
+
+      # 下载时 GitHub 会把单个 artifact 自动打包成 PCL-CHCE-exe.zip，
+      # 解压后就是 PCL CHCE.exe（即「包含 .exe 的 zip」）
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: PCL-CHCE-exe
+          path: dist/PCL CHCE.exe
+          if-no-files-found: error
+          retention-days: 90  
